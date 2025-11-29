@@ -1,54 +1,31 @@
-import sqlite3
 import streamlit as st
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver # <--- Use Memory
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
-import os
+import uuid
 
 load_dotenv()
 
 # Setup Model
 model = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
 
-# --- DATABASE SETUP (Auto-Migrating) ---
+# --- IN-MEMORY STORAGE (Stable for Cloud Demos) ---
+# We use global dictionaries to simulate a DB. 
+# This works perfectly for the lifespan of the Cloud container.
+
+if "THREAD_DB" not in st.session_state:
+    st.session_state["THREAD_DB"] = {}
+
+# We need a checkpointer that survives reruns but is in memory
 @st.cache_resource
-def setup_database():
-    """
-    Sets up the SQLite connection and handles schema updates.
-    """
-    conn = sqlite3.connect("chatbot.db", check_same_thread=False)
-    cursor = conn.cursor()
+def get_checkpointer():
+    return MemorySaver()
 
-    # 1. Create table if it doesn't exist (Initial setup)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS thread_titles (
-            thread_id TEXT PRIMARY KEY, 
-            title TEXT,
-            user_id TEXT
-        )
-    """)
-    
-    # 2. SCHEMA MIGRATION: Check if 'user_id' column exists
-    # (Fixes the crash if you have an old DB file)
-    cursor.execute("PRAGMA table_info(thread_titles)")
-    columns = [info[1] for info in cursor.fetchall()]
-    
-    if 'user_id' not in columns:
-        print("Migrating database: Adding user_id column...")
-        cursor.execute("ALTER TABLE thread_titles ADD COLUMN user_id TEXT")
-        conn.commit()
-
-    conn.commit()
-    
-    checkpointer = SqliteSaver(conn=conn)
-    return conn, checkpointer
-
-# Initialize DB
-conn, checkpointer = setup_database()
+checkpointer = get_checkpointer()
 
 # --- Graph Setup ---
 class ChatState(TypedDict):
@@ -67,40 +44,39 @@ chatbot = graph.compile(checkpointer=checkpointer)
 # --- Helper Functions ---
 
 def generate_title(thread_id, user_message, user_id):
-    """Generates a title and links it to the specific User ID"""
+    """Generates a title and stores it in the global dictionary."""
     try:
         summary_prompt = f"Summarize this query in 3-5 words for a chat title: {user_message}"
         title_response = model.invoke(summary_prompt)
         title = title_response.content.strip().replace('"', '')
         
-        # Insert with User ID
-        conn.execute(
-            "INSERT OR REPLACE INTO thread_titles (thread_id, title, user_id) VALUES (?, ?, ?)", 
-            (str(thread_id), title, user_id)
-        )
-        conn.commit()
+        # Save to our simulated DB
+        # Structure: {user_id: {thread_id: title}}
+        if "simulated_db" not in st.session_state:
+            st.session_state.simulated_db = {}
+            
+        if user_id not in st.session_state.simulated_db:
+            st.session_state.simulated_db[user_id] = {}
+            
+        st.session_state.simulated_db[user_id][thread_id] = title
+        
     except Exception as e:
         print(f"Error generating title: {e}")
 
 def retrieve_all_threads(user_id):
-    """Retrieves only the threads belonging to the current user"""
-    cursor = conn.cursor()
+    """Retrieves threads from the simulated DB."""
+    if "simulated_db" not in st.session_state:
+        st.session_state.simulated_db = {}
+        
+    user_threads = st.session_state.simulated_db.get(user_id, {})
     
-    # Filter by user_id
-    try:
-        cursor.execute("SELECT thread_id, title FROM thread_titles WHERE user_id = ?", (user_id,))
-        results = []
-        for row in cursor.fetchall():
-            results.append({'id': row[0], 'title': row[1]})
-        return results
-    except sqlite3.OperationalError:
-        # Fallback if migration failed or DB is locked
-        return []
+    results = []
+    for tid, title in user_threads.items():
+        results.append({'id': tid, 'title': title})
+    
+    return results
 
 def flush_user_history(user_id):
-    """Clears history for the specific user only"""
-    try:
-        conn.execute("DELETE FROM thread_titles WHERE user_id = ?", (user_id,))
-        conn.commit()
-    except Exception as e:
-        print(f"Error flushing DB: {e}")
+    """Clears history for the specific user."""
+    if "simulated_db" in st.session_state and user_id in st.session_state.simulated_db:
+        del st.session_state.simulated_db[user_id]
