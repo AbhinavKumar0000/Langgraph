@@ -7,28 +7,41 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+import os
 
 load_dotenv()
 
 # Setup Model
 model = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
 
-# --- DATABASE SETUP (Cached & Thread Safe) ---
+# --- DATABASE SETUP (Auto-Migrating) ---
 @st.cache_resource
 def setup_database():
     """
-    Sets up the SQLite connection ONCE per session.
+    Sets up the SQLite connection and handles schema updates.
     """
     conn = sqlite3.connect("chatbot.db", check_same_thread=False)
-    
-    # Create table to map Threads to Users
-    conn.execute("""
+    cursor = conn.cursor()
+
+    # 1. Create table if it doesn't exist (Initial setup)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS thread_titles (
             thread_id TEXT PRIMARY KEY, 
             title TEXT,
             user_id TEXT
         )
     """)
+    
+    # 2. SCHEMA MIGRATION: Check if 'user_id' column exists
+    # (Fixes the crash if you have an old DB file)
+    cursor.execute("PRAGMA table_info(thread_titles)")
+    columns = [info[1] for info in cursor.fetchall()]
+    
+    if 'user_id' not in columns:
+        print("Migrating database: Adding user_id column...")
+        cursor.execute("ALTER TABLE thread_titles ADD COLUMN user_id TEXT")
+        conn.commit()
+
     conn.commit()
     
     checkpointer = SqliteSaver(conn=conn)
@@ -74,13 +87,15 @@ def retrieve_all_threads(user_id):
     cursor = conn.cursor()
     
     # Filter by user_id
-    cursor.execute("SELECT thread_id, title FROM thread_titles WHERE user_id = ?", (user_id,))
-    
-    results = []
-    for row in cursor.fetchall():
-        results.append({'id': row[0], 'title': row[1]})
-    
-    return results
+    try:
+        cursor.execute("SELECT thread_id, title FROM thread_titles WHERE user_id = ?", (user_id,))
+        results = []
+        for row in cursor.fetchall():
+            results.append({'id': row[0], 'title': row[1]})
+        return results
+    except sqlite3.OperationalError:
+        # Fallback if migration failed or DB is locked
+        return []
 
 def flush_user_history(user_id):
     """Clears history for the specific user only"""
